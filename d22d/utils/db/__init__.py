@@ -32,14 +32,15 @@ from .sqlfileextra import SqlExtractor, match_insert, RANDOM_STR
 from ..utils import format_error, with_cur_lock, gen_pass, run_task_auto_retry
 from clickhouse_driver import connect as clickhouse_connect
 from threading import Lock
+from collections import defaultdict
 from threading import local as threading_local
 
 
 def get_table_name_from_sql(sql):
     pattern = {
-    'select' : r"(?!')*\bfrom\b\s+\b(?P<table_name>\w+)\b\s+\b(?P<table_sn>\w+)\b(?!')*",
-    'insert' : r"(?!')*\binsert\b\s+\binto\b\s+\b(?P<table_name>\w+)\b\s+\b(?P<table_sn>\w+)\b(?!')*",
-    'update' : r"(?!')*\bupdate\b\s+\b(?P<table_name>\w+)\b\s+\b(?P<table_sn>\w+)(?!')+",
+        'select': r"(?!')*\bfrom\b\s+\b(?P<table_name>\w+)\b\s+\b(?P<table_sn>\w+)\b(?!')*",
+        'insert': r"(?!')*\binsert\b\s+\binto\b\s+\b(?P<table_name>\w+)\b\s+\b(?P<table_sn>\w+)\b(?!')*",
+        'update': r"(?!')*\bupdate\b\s+\b(?P<table_name>\w+)\b\s+\b(?P<table_sn>\w+)(?!')+",
     }
     res = re.compile(pattern[sql.lower().strip().split(' ')[0]], re.S | re.IGNORECASE).search(sql)
     if res:
@@ -98,15 +99,13 @@ class ElasticSearchD(EsModel):
 
     def get_data(self, index, *args, **kwargs):
         if isinstance(index, str):
-            if 'condition' in kwargs:
-                query = kwargs.pop('condition')
-            else:
-                query = {}
+            query = {}
+            index_name = index
         else:
+            index_name = index[0]
             query = index[1]
-            index = index[0]
         logging.debug(json.dumps(query))
-        for i in self.scan(query=query, index=index, *args, **kwargs):
+        for i in self.scan(query=query, index=index_name, *args, **kwargs):
             r = {}
             if r.get('id'):
                 r['_id'] = i['_id']
@@ -120,7 +119,7 @@ class ElasticSearchD(EsModel):
         write_kws = {k: kwargs[k] for k in ['batch_size', 'retry'] if k in kwargs}
         for d in data:
             if pks:
-                _id = '-'.join(d[k] for k in pks.split(','))
+                _id = '-'.join(str(d[k]) for k in pks.split(','))
             elif '_id' in d:
                 _id = d['_id']
             else:
@@ -128,7 +127,8 @@ class ElasticSearchD(EsModel):
 
             if pop_id:
                 for k in pop_id.split(','):
-                    d.pop(k)
+                    if k in d:
+                        d.pop(k)
             actions.append({
                 '_op_type': 'index',  # 操作 index update create delete
                 '_index': index,  # index
@@ -142,7 +142,6 @@ class ElasticSearchD(EsModel):
         if len(actions):
             self.bulk_write(actions, **write_kws)
 
-
     def get_indexes(self):
         return list(self.es.indices.get_alias().keys())
 
@@ -151,13 +150,14 @@ class ElasticSearchD(EsModel):
 
     def get_count(self, index, *args, **kwargs):
         if isinstance(index, str):
+            index_name = index
             query = {}
         else:
-            query = {'query': index[1]['query']}
-            index = index[0]
-            if query.get("_source"):
-                query.pop("_source")
-        return int(self.es.count(index=index, body=query)['count'])
+            index_name = index[0]
+            query = {'query': index[1].get('query')} if index[1] and index[1].get('query') else {}
+            # if query.get("_source"):
+            #     query.pop("_source")
+        return int(self.es.count(index=index_name, body=query)['count'])
 
     @staticmethod
     def get_int_type_from_len(length):
@@ -184,10 +184,6 @@ class ElasticSearchD(EsModel):
         return None
 
     def create_index(self, index, data, pks='id'):
-        # sql = """SET NAMES utf8mb4;"""
-        # sql += """SET FOREIGN_KEY_CHECKS = 0;"""
-        # if drop == 1:
-        #     sql += """DROP TABLE IF EXISTS `{}`;""".format(tbname)
         pairs = {
             "settings": {
                 "index": {
@@ -195,33 +191,19 @@ class ElasticSearchD(EsModel):
                     "number_of_replicas": 1
                 }
             },
-            'mappings': {"doc": {
-                'properties': {
-
-                }}
-            }
+            'mappings': {}
         }
-        properties = pairs['mappings']['doc']['properties']
-        # ES7以上删掉doc层
-        # pairs = {
-        #     "settings": {
-        #         "index": {
-        #             "number_of_shards": 1,
-        #             "number_of_replicas": 1
-        #         }
-        #     },
-        #     'mappings': {
-        #         'properties': {
-        #
-        #         }
-        #     }
-        # }
-        # properties = pairs['mappings']['properties']
-
+        properties = {}
         if self.cols_ddl:
             if self.cols_ddl[index].get('mappings'):
-                pairs['mappings'] = self.cols_ddl[index]['mappings']
+                # cols_ddl 字典里有 mappings
+                mapping = self.cols_ddl[index]['mappings']
+                if "properties" in mapping:
+                    properties = mapping['properties']
+                else:
+                    properties = mapping.get('doc', {}).get('properties', {})
             else:
+                # cols_ddl 字典里 是 mysql 的类型
                 for col, col_type in self.cols_ddl[index].items():
                     properties[col] = {}
                     if col_type in ['int', 'bigint', 'integer', 'tinyint', 'smallint', 'mediumint']:
@@ -230,7 +212,8 @@ class ElasticSearchD(EsModel):
                         properties[col]['type'] = 'float'
                     elif col_type in ['bit']:
                         properties[col]['type'] = 'long'
-                    elif col_type in ['char', 'varchar', 'text', 'tinyblob', 'tinytext', 'blob', 'mediumtext', 'mediumblob',
+                    elif col_type in ['char', 'varchar', 'text', 'tinyblob', 'tinytext',
+                                      'blob', 'mediumtext', 'mediumblob',
                                       'longtext', 'longblob', 'json', 'timestamp', 'datetime']:
                         properties[col] = {
                             "type": "text",
@@ -266,6 +249,13 @@ class ElasticSearchD(EsModel):
                     if self.ik:
                         properties[name]["fields"]["analyzer"] = "ik_max_word"
                         properties[name]["fields"]["search_analyzer"] = "ik_smart"
+
+        # ES7以上删掉doc层
+        if int(self.es.info().get('version', {}).get('number', '0').split('.')[0]) >= 7:
+            pairs['mappings'] = {'properties': properties}
+        else:
+            pairs['mappings'] = {"doc": {'properties': properties}}
+
         if self.es.indices.exists(index=index) is not True:
             res = self.es.indices.create(index=index, body=pairs)
             if not res:
@@ -396,7 +386,9 @@ class MySqlD(ClientPyMySQL, ABC):
 
     def get_table_ddl(self, index):
         sql = f"show create table {index}"
-        return 'CREATE TABLE IF NOT EXISTS ' + self._execute(sql=sql)[1].__next__()['Create Table'].replace('\n', '').strip('CREATE TABLE')
+        return 'CREATE TABLE IF NOT EXISTS ' + self._execute(sql=sql)[1].__next__()['Create Table'].replace('\n',
+                                                                                                            '').strip(
+            'CREATE TABLE')
 
     def get_count(self, index, *args, **kwargs):
         if index.lower().strip().startswith('select '):
@@ -534,7 +526,7 @@ class BaseFileD(object):
     def w_open_func(cls, *args, **kwargs):
         return open(*args, **kwargs)
 
-    def create_index(self, index, data, pks='id'):
+    def create_index(self, index, data, pks='id', backup=True, file_mode='w'):
         if not os.path.exists(self.path):
             try:
                 os.makedirs(self.path)
@@ -542,12 +534,12 @@ class BaseFileD(object):
                 logging.warning(e)
                 Path(self.path).mkdir(parents=True, exist_ok=True)
         path = self.gen_path_by_index(index)
-        if os.path.exists(path):
+        if backup and os.path.exists(path):
             os.rename(path, f"{path}.{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.bak")
         dirname = os.path.dirname(path)
         if not os.path.exists(dirname):
             os.makedirs(dirname)
-        self._file_w.setdefault(index, self.w_open_func(path, 'w', encoding=self.encoding, newline=self.newline))
+        self._file_w.setdefault(index, self.w_open_func(path, file_mode, encoding=self.encoding, newline=self.newline))
 
 
 class CsvD(BaseFileD):
@@ -589,12 +581,13 @@ class CsvD(BaseFileD):
         self.__file_w[index].writerows([d for d in data])
         self._file_w[index].flush()
 
-    def create_index(self, index, data, pks='id'):
-        super(self.__class__, self).create_index(index, data)
+    def create_index(self, index, data, pks='id', backup=True, file_mode='w'):
+        super(self.__class__, self).create_index(index, data, pks, backup, file_mode)
         # self._file_w[index].writerow((self.split.join(f'"{v.__repr__()[1:-1]}"' for v in data.keys()) + '\n'))
         self.__file_w[index].fieldnames = [v for v in data.keys()]
         self.__file_w[index].writeheader()
         self._file_w[index].flush()
+
 
 class TxtD(BaseFileD):
     def __init__(self, path, split=',', extension='txt', encoding='utf8'):
@@ -616,7 +609,6 @@ class TxtD(BaseFileD):
                 self.___file_w[k] = v
         return self.___file_w
 
-
     def get_data(self, index, fieldnames=None, restkey=None, restval=None,
                  dialect="excel", **kwargs):
         with open(self.gen_path_by_index(index), 'r', encoding=self.encoding) as f:
@@ -629,10 +621,12 @@ class TxtD(BaseFileD):
         self._file_w[index].writelines((self.split.join(v.__repr__() for v in d.values()) + '\n') for d in data)
         self._file_w[index].flush()
 
-    def create_index(self, index, data, pks='id'):
-        super(self.__class__, self).create_index(index, data)
+
+    def create_index(self, index, data, pks='id', backup=True, file_mode='w'):
+        super(self.__class__, self).create_index(index, data, pks, backup, file_mode)
         self._file_w[index].writelines((self.split.join(v.__repr__() for v in data.keys()) + '\n'))
         self._file_w[index].flush()
+
 
 class ZipD(object):
     def __init__(self, path, get_file_data_func=None, fieldnames=None, extension='zip', encoding='utf8'):
@@ -651,6 +645,8 @@ class ZipD(object):
         return 1
 
     def get_data(self, index, **kwargs):
+        from ..ziputils import un_zip, iter_path, remove_folder
+
         uz_path = None
         try:
             uz_path = un_zip(os.path.join(self.path, f'{index}.{self.extension}'), **kwargs)
@@ -675,6 +671,9 @@ class RarD(ZipD):
             fieldnames=fieldnames or [], extension=extension, encoding=encoding)
 
     def get_data(self, index, **kwargs):
+        from ..rarutils import un_rar, remove_folder
+        from ..ziputils import iter_path
+
         ur_path = None
         try:
             ur_path = un_rar(os.path.join(self.path, f'{index}.{self.extension}'), **kwargs)
@@ -808,8 +807,8 @@ class SqlFileD(BaseFileD):
 
         self._file_w[index].flush()
 
-    def create_index(self, index, data, pks='id'):
-        super(self.__class__, self).create_index(index, data)
+    def create_index(self, index, data, pks='id', backup=True, file_mode='w'):
+        super(self.__class__, self).create_index(index, data, pks, backup, file_mode)
         # self._file_w[index].writerow((self.split.join(f'"{v.__repr__()[1:-1]}"' for v in data.keys()) + '\n'))
 
 
@@ -905,8 +904,8 @@ class XlsIbyFileD(BaseFileD):
         wb = openpyxl.Workbook()
         return wb
 
-    def create_index(self, index, data, pks='id'):
-        super().create_index(index, data)
+    def create_index(self, index, data, pks='id', backup=True, file_mode='w'):
+        super(self.__class__, self).create_index(index, data, pks, backup, file_mode)
         self._file_w_now_sheet_num[index] = 0
         self._file_w_now_sheet[index] = self._file_w[index].create_sheet(index=self._file_w_now_sheet_num[index])
         keys = [key for key in data.keys()]
@@ -928,7 +927,7 @@ class XlsIbyFileD(BaseFileD):
                 except Exception as e:
                     logging.error(e)
                     traceback.print_exc()
-                    time.sleep(5)
+                    time.sleep(2)
 
 
 class XlsxIbyFileD(XlsIbyFileD):
@@ -955,6 +954,23 @@ class XlsxIbyFileD(XlsIbyFileD):
             for row in worksheet.iter_rows(min_row=2):
                 data = {keys[i]: cell.value for i, cell in enumerate(row)}
                 yield data
+
+    def get_cols_name_set(self, index):
+        workbook = openpyxl.load_workbook(self.gen_path_by_index(index))  # 文件路径
+        # 获取所有sheet的名字
+        cols_name = set()
+        for idx, worksheet in enumerate(workbook):
+            logging.info(f'sheet:{idx}:{worksheet.title}')
+            nrows = worksheet.max_row
+            if not nrows:
+                continue
+            keys = {i: key.value for i, key in enumerate(worksheet[1])}
+            print(f'sheet:{idx}:{worksheet.title}, keys:{keys}')
+            cols_name = cols_name | set(keys.values())
+        cols_name.remove(None)
+        cols_name_l = list(cols_name)
+        cols_name_l.sort()
+        return cols_name_l
 
 
 class MongoDBD(object):
@@ -1038,7 +1054,7 @@ class BaseClient(ABC):
         return self.conn.cursor()
 
     @classmethod
-    def gen_insert_sql(cls, table_name, data, duplicate_update=False, partition='',):
+    def gen_insert_sql(cls, table_name, data, duplicate_update=False, partition='', ):
         keys = []
         values = []
         for k, v in data.items():
@@ -1219,7 +1235,7 @@ class BaseClient(ABC):
 
     @with_cur_lock()
     def execute_iter_d(self, cur, sql, parms=None, *args, **kwargs):
-        print(sql)
+        print("execute_iter_d", sql)
         cur.set_stream_results(True, 1000)
         cur.execute(sql, parms, *args, **kwargs)
         result = cur.fetchmany(1000)
@@ -1272,6 +1288,7 @@ class ClickHouseD(BaseClient):
         """
         查看表结构
         """
+        self._cur = None
         return self.execute(f'desc {table_name}')
 
     def cols_type(self, table_name):
@@ -1280,6 +1297,7 @@ class ClickHouseD(BaseClient):
     def get_count(self, index, *args, **kwargs):
         if index.lower().strip().startswith('select '):
             index = f'({index.strip()})'
+        self._cur = None
         return self.execute(f'select count(0) as c from  {index} as taSDFEWVempTABlesdfecH')[0][0]
 
     @classmethod
@@ -1313,9 +1331,15 @@ class ClickHouseD(BaseClient):
     @classmethod
     def format_data_range(cls, data):
         for k, v in data.items():
-            if isinstance(data[k], datetime.date):
-                if data[k] < ClickHouseD.min_datetime or data[k] > ClickHouseD.max_datetime:
-                    data[k] = ClickHouseD.min_datetime
+            # 不能用isinstance，isinstance会考虑datetime的父类date
+            if type(data[k]) == datetime.date:
+                if data[k] < cls.min_datetime.date() or data[k] > cls.max_datetime.date():
+                    data[k] = cls.min_datetime.date()
+                if getattr(data[k], 'read', None):
+                    data[k] = data[k].read()
+            elif type(data[k]) == datetime.datetime:
+                if data[k] < cls.min_datetime or data[k] > cls.max_datetime:
+                    data[k] = cls.min_datetime
                 if getattr(data[k], 'read', None):
                     data[k] = data[k].read()
         return data
@@ -1342,9 +1366,11 @@ class ClickHouseD(BaseClient):
             return
         sql, values = self.gen_insert_sql_no_v(index, insert_rows[0])
         insert_num = int((len(insert_rows) + windows - 1) / windows)
+        self._cur = None
         for i in range(insert_num):
             temp = insert_rows[i * windows:(i + 1) * windows:]
             logging.info('准备插入{}条数据'.format(len(temp)))
+
             try:
                 self.executemany(
                     sql,
@@ -1356,10 +1382,12 @@ class ClickHouseD(BaseClient):
     def insert_from_mysql(self, table_to, host, port, database, table, user, password):
         # 直接插入到clickhouse现有表
         sql = f"""insert into {table_to} SELECT * FROM mysql('{host}:{port}', '{database}', '{table}', '{user}', '{password}')"""
+        self._cur = None
         self.execute(sql, types_check=True)
 
     def is_table_exist(self, index):
         try:
+            self._cur = None
             if self.execute(f'select count(*) from {index}'):
                 return True
         except Exception:
@@ -1388,6 +1416,7 @@ class ClickHouseD(BaseClient):
         sql = sql.strip(',') + ')'
 
         sql += """ENGINE = Memory();"""
+        self._cur = None
         self.execute(sql)
 
     def set_default_data(self, index):
@@ -1409,16 +1438,19 @@ class ClickHouseD(BaseClient):
         if distribution:
             pass
         else:
+            self._cur = None
             return self.execute(f'show create table {index}')[0][0].replace('\n', ' ')
 
     def get_data(self, index, *args, **kwargs):
         sub_sql = f"{index} {kwargs.pop('condition')}" if 'condition' in kwargs else index
+        self._cur = None
         if index.lower().strip().startswith('select '):
             return self.execute_iter_d(sql=f'{sub_sql}', *args, **kwargs)
         else:
             return self.execute_iter_d(sql=f'select * from {sub_sql}', *args, **kwargs)
 
     def get_indexes(self):
+        self._cur = None
         return [i[0] for i in self.execute(f'show tables from {self.database}')]
 
     def get_cols_type(self, index):
@@ -1524,6 +1556,7 @@ class OracleD(BaseClient):
                     except oracle_DatabaseError:
                         time.sleep(600)
                         result = run_task_auto_retry(_dbcur.fetchmany, kwargs={'batch': batch})
+
             return _fetch(cur)
         except Exception as e:
             raise e
